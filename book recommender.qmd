@@ -1,0 +1,956 @@
+---
+title: "Book Recommender System"
+author: "Tshilisanani Dzivhani"
+format: pdf
+editor: visual
+---
+
+## Introduction
+
+The aim of this report is to present a recommender system/model that suggests books that users might enjoy based on their previous evaluations. The recommender system will be based on three methodologies: user-based Collaborative Filtering (CF), item-based CF, and Matrix Factorisation. The models were built and evaluated on the publicly available Book Recommendation Dataset, downloaded from Kaggle.
+
+## Exploratory Data Analysis
+
+Before building the recommender models, all the required libraries were loaded into R, together with the necessary data files. There were three CSV files relevant to this project: Books, which contained the main identifiers of the books (Author, Title, Year, ISBN); Ratings, which contained instances of a specific user rating a specific book as identified by ISBN; and lastly, Users, which contained anonymised User-ID, location, and age. The Exploratory Data Analysis (EDA) involved exploring these datasets and transforming the data to get it to a state that could be used for building the required models.
+
+```{r}
+#| echo: false
+#| include: false
+#tinytex::install_tinytex()
+library(tidyverse)
+library(data.table)
+library(proxy)
+library(parallel)
+library(recosystem)
+library(knitr)
+library(kableExtra)
+library(gt)
+
+set.seed(123)
+
+books <- fread("Books.csv")
+ratings <- fread("Ratings.csv")
+users <- fread("Users.csv")
+
+```
+
+```{r}
+#| echo: false
+#| include: false
+
+str(books)
+str(ratings)
+str(users)
+
+
+```
+
+```{r}
+#| echo: false
+#| include: false
+sum(is.na(books))
+sum(is.na(ratings))
+sum(is.na(users))
+
+```
+
+The datasets contained `r nrow(books)` books, `r nrow(ratings)` ratings, and `r nrow(users)` users. This data was found to contain `r sum(is.na(books))`, `r sum(is.na(ratings))`, and `r sum(is.na(users))` NA values respectively. A deeper look into the users table revealed that the missing values were mostly users' age.
+
+
+```{r}
+#| echo: false
+#| include: false
+
+books$`Year-Of-Publication` <- as.numeric(books$`Year-Of-Publication`)
+books$`Year-Of-Publication`[is.na(books$`Year-Of-Publication`)] <- 0
+users$Age <- as.integer(users$Age)
+
+```
+
+The type of variable used to store the users age and books year of publication was changed from char to numeric. This was done to facilitate the visualisation of the distribution of these two metrics. NA values in the year of publications that were introduced as a result of this conversion were converted to 0 as it was found to be an already existing way that books with unknown publication-years were recorded.
+
+```{r}
+#| echo: false
+#| include: false
+str(books)
+str(users)
+sum(is.na(books))
+sum(is.na(ratings))
+sum(is.na(users))
+
+```
+
+```{r}
+#| echo: false
+#| include: false
+print(paste("Number of duplicate books:", sum(duplicated(books$ISBN))))
+print(paste("Number of duplicate ratings:", sum(duplicated(ratings))))
+print(paste("Number of duplicate users:", sum(duplicated(users$`User-ID`))))
+
+```
+
+The data was checked for duplicate entries, and there was found to be no duplicates existing in the data.
+
+### Data Distribution
+
+A series of Histograms and Boxplots were plotted to visualise the distribution of the data. A histogram depicting the distribution of ratings is shown below
+
+
+```{r}
+#| echo: false
+par(mfrow=c(1, 2))
+ggplot(ratings, aes(x = `Book-Rating`)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Distribution of Ratings", x = "Rating", y = "Count") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+From the plots of ratings it is notable that implicit ratings (those with a rating of zero) were majority of the ratings by a large margin. These ratings are said not to work well with similarity matrices, so they were separated from explicit ratings which were used for both user based and item based CF models. Implicit ratings would only be used later on in the matrix factorization model.
+
+```{r}
+#| echo: false
+explicit_ratings <- ratings %>% filter(`Book-Rating` > 0)
+#count(explicit_ratings)
+
+ggplot(explicit_ratings, aes(x = `Book-Rating`)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Distribution of Explicit Ratings", x = "Rating", y = "Count") +
+  scale_x_continuous(breaks = 1:10)+
+  theme(plot.title = element_text(hjust = 0.5))
+
+par(mfrow=c(1, 1))
+```
+
+Looking at explicit ratings, one also notes how the ratings were biased, with ratings on the upper end of the scale dominating the dataset. This bias was noted as worth investigating in future research. It may be worth considering the effect of standardization of the ratings on the performance of the models.
+
+```{r}
+#| echo: false
+ggplot(books %>% filter(`Year-Of-Publication` != 0), aes(x = `Year-Of-Publication`, y = "")) +
+  geom_boxplot(fill = "green", color = "black") +
+  labs(title = "Distribution of Book Publication Years", x = "Publication Year", y = "") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
+```
+
+A boxplot of the years of publications was plotted, excluding year 0 which was taken as implying missing information. From this plot, it is notable that the books span a long period, with some books being from the 1300s. The vast majority of the books though, were published in the late 20th century, with a sizeable portion coming from early 2000s. The highest year in this record is `r max(books[['Year-Of-Publication']], na.rm = TRUE)`, which goes against intuition as that year is still a quarter of a century into the future.
+
+```{r}
+#| echo: false
+#| warning: false
+ggplot(users, aes(x = Age, y = "")) +
+  geom_boxplot(fill = "red", color = "black") +
+  labs(title = "Distribution of User Ages", x = "Age", y = "") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+```{r}
+#| echo: false
+```
+
+The distribution of the user age revealed a controversial picture as well, having years as little as zero and reaching just shy of 250. This reveals an obvious inconsistency as human lifespan does not reach that long and it is also understood that those with an age of zero do not have the ability to read or write reviews. It is conceivable though that many users could have recorded their ages wrongly.
+
+
+```{r}
+#| echo: false
+#| warning: false
+# Display the top books with most ratings along with their names
+ratings %>%
+  inner_join(books, by = "ISBN") %>%
+  group_by(`Book-Title`, `Year-Of-Publication`) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  arrange(desc(count)) %>%
+  head() %>%
+  select(`Book-Title`, `Year-Of-Publication`, count) %>%
+  gt() %>%
+  tab_header(
+    title = "Top Books with Most Ratings"
+  ) %>%
+  fmt_number(
+    columns = c(count),
+    decimals = 0
+  ) %>%
+  cols_label(
+    `Book-Title` = "Book Title",
+    `Year-Of-Publication` = "Publication Year",
+    count = "Count"
+  )
+
+```
+
+The table shows that books with the most ratings were books around the turn of the 21st century. This seems to align with the boxplot which shows most publications being around this period. A noticeable trend is that the number of reviews generally increased with the years displayed.
+
+```{r}
+#| warning: false
+#| echo: false
+# Display the details of the top users with most ratings
+ratings %>%
+  group_by(`User-ID`) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  arrange(desc(count)) %>%
+  head() %>%
+  inner_join(users, by = "User-ID") %>%
+  gt() %>%
+  tab_header(
+    title = "Top Users with Most Ratings"
+  ) %>%
+  fmt_number(
+    columns = c(count),
+    decimals = 0
+  ) %>%
+  cols_label(
+    `User-ID` = "User ID",
+    count = "Count"
+  )
+
+```
+
+From the table of users with most ratings it can be seen that most of the top users come from the USA, with Minnesota and Georgia contributing the most. Canada is the only other country appearing on this list. Of the few ages recorded, one can also see that the ages of the top raters are those of the young elderly. The number of reviews is hard to believe, though, as some would have had to read more than a hundred books for every year they lived.
+
+
+```{r}
+#| echo: false
+
+
+```
+
+To further prepare the data for Collaborative filtering algorithms, the books table was joined with the explicit ratings table using the inner join function. The inner join function was specifically chosen to ensure that there would be no NA values introduced due to a mismatch in the ISBN IDs available in both tables.
+
+
+```{r}
+#| echo: false
+explicit_ratings <- explicit_ratings %>% inner_join(books, by = "ISBN")
+
+```
+
+```{r}
+#| echo: false
+book_ratings_count <- explicit_ratings %>% group_by(ISBN) %>% summarise(count = n())
+books_to_keep <- book_ratings_count %>% filter(count >= 15) %>% pull(ISBN)
+filtered_ratings <- explicit_ratings %>% filter(ISBN %in% books_to_keep)
+
+user_ratings_count <- filtered_ratings %>% group_by(`User-ID`) %>% summarise(count = n())
+users_to_keep <- user_ratings_count %>% filter(count >= 5) %>% pull(`User-ID`)
+filtered_ratings <- filtered_ratings %>% filter(`User-ID` %in% users_to_keep)
+
+
+```
+
+After joining the two tables, there were `r nrow(book_ratings_count)` books and `r n_distinct(explicit_ratings[['User-ID']])` users. These numbers were deemed to be too large, requiring a lot of computing resources to process in the model building stage. The values were therefore filtered to a significantly lower number. The books were filtered to contain those books with more than 15 ratings, and users were subsequently filtered to keep only those with more than 5 ratings. In the end, the filtered ratings kept `r length(books_to_keep)` books and `r length(users_to_keep)` users. It is noted that quite a large number of observations were filtered out, and this could negatively impact the performance of the models. However, it is noted that scaling up the models would be as easy as reducing the threshold of the filters and could be implemented with the availability of more time or computing resources.
+
+## Collaborative Filtering Models
+
+In lead up to the two CF models, a user item matrix was created using the filtered ratings. As the process of creating the matrix is resource intensive, the matrix was saved in an rds file which can be loaded quickly when rerunning this analysis.
+
+```{r}
+#| echo: false
+# # User matrix
+# user_item_matrix <- as.matrix(xtabs(`Book-Rating` ~ `User-ID` + ISBN, data = filtered_ratings))
+# 
+# # Save the user-item matrix
+# saveRDS(user_item_matrix, file = "user_item_matrix.rds")
+
+# Load the user-item matrix from the file
+user_item_matrix <- readRDS("user_item_matrix.rds")
+
+```
+
+A function was created to calculate and create user-similarity and item similarity matrices. Two strategies were employed to speed up the calculations by this function. First, the function made use of parallel computing, using all but 2 cores that were available on the computer. The second strategy was to calculate only one triangle of the matrix and copy the values to the other side as the process of copying required much less steps and resources to complete. Both these matrices were saved to save computing resources in subsequent runs of this analysis.
+
+```{r}
+#| echo: false
+# library(doParallel)
+# library(foreach)
+# 
+# # Custom function to calculate cosine similarity
+# cosine_similarity <- function(x, y) {
+#   sum(x * y) / (sqrt(sum(x^2)) * sqrt(sum(y^2)))
+# }
+# 
+# # Custom function to calculate similarity matrices
+# calculate_similarity <- function(user_item_matrix, num_cores = detectCores() - 2) {
+#   library(doParallel)
+#   library(foreach)
+#   
+#   # Register parallel backend
+#   cl <- makeCluster(num_cores)
+#   registerDoParallel(cl)
+#   
+#   # Export the cosine_similarity function to the worker nodes
+#   clusterExport(cl, "cosine_similarity")
+#   
+#   # Calculate item-item similarity using parallel computing
+#   item_similarity <- matrix(NA, ncol(user_item_matrix), ncol(user_item_matrix))
+#   item_similarity <- foreach(i = 1:ncol(user_item_matrix), .combine = 'cbind', .packages = 'base') %dopar% {
+#     sapply(1:ncol(user_item_matrix), function(j) {
+#       if (i <= j) {
+#         cosine_similarity(user_item_matrix[, i], user_item_matrix[, j])
+#       } else {
+#         NA
+#       }
+#     })
+#   }
+#   
+#   # Fill the lower triangle of the item similarity matrix
+#   for (i in 1:ncol(item_similarity)) {
+#     for (j in 1:i) {
+#       if (is.na(item_similarity[j, i])) {
+#         item_similarity[j, i] <- item_similarity[i, j]
+#       }
+#     }
+#   }
+#   
+#   # Calculate user-user similarity using parallel computing
+#   user_similarity <- matrix(NA, nrow(user_item_matrix), nrow(user_item_matrix))
+#   user_similarity <- foreach(i = 1:nrow(user_item_matrix), .combine = 'cbind', .packages = 'base') %dopar% {
+#     sapply(1:nrow(user_item_matrix), function(j) {
+#       if (i <= j) {
+#         cosine_similarity(user_item_matrix[i, ], user_item_matrix[j, ])
+#       } else {
+#         NA
+#       }
+#     })
+#   }
+#   
+#   # Fill the lower triangle of the user similarity matrix
+#   for (i in 1:nrow(user_similarity)) {
+#     for (j in 1:i) {
+#       if (is.na(user_similarity[j, i])) {
+#         user_similarity[j, i] <- user_similarity[i, j]
+#       }
+#     }
+#   }
+#   
+#   # Stop the cluster
+#   stopCluster(cl)
+#   
+#   return(list(item_similarity = item_similarity, user_similarity = user_similarity))
+# }
+# 
+# # Calculate the similarity matrices
+# similarity_matrices <- calculate_similarity(user_item_matrix)
+# 
+# # Save the similarity matrices to files
+# saveRDS(similarity_matrices$item_similarity, file = "item_similarity_custom.rds")
+# saveRDS(similarity_matrices$user_similarity, file = "user_similarity_custom.rds")
+# 
+```
+
+```{r}
+#| echo: false
+#| include: false
+# Load the similarity matrices
+item_similarity <- readRDS("item_similarity_custom.rds")
+user_similarity <- readRDS("user_similarity_custom.rds")
+
+# Assign dimension names to the similarity matrices
+dimnames(item_similarity) <- list(colnames(user_item_matrix), colnames(user_item_matrix))
+dimnames(user_similarity) <- list(rownames(user_item_matrix), rownames(user_item_matrix))
+
+# Inspect the similarity matrices
+str(item_similarity)
+str(user_similarity)
+
+
+```
+
+### Item Based CF
+
+Next, a function was created, using item-based collaborative filtering to predict a rating for any user-item pair in the user_item matrix. The function works by identifying the indices of the user and item in the matrix. It then retrieves the user's ratings and the similarities of the target item with other items. The function filters out zero ratings to focus only on items that the user has rated. It calculates the weighted sum of these ratings using the item similarities and sums the similarities of the rated items. The predicted rating is obtained by dividing the weighted sum of ratings by the sum of similarities, provided that the sum of similarities exceeds a specified threshold. If the sum of similarities is below the threshold, the function returns NA. This approach ensures that the prediction is based on sufficiently similar items to provide a reliable rating estimate.
+
+
+```{r}
+#| echo: false
+#| include: false
+# Function to predict ratings using item-based collaborative filtering
+predict_rating_item_based <- function(user_id, item_id, user_item_matrix, item_similarity, similarity_threshold = 0.01) {
+   # Get the indices of the user and item
+  user_index <- which(rownames(user_item_matrix) == user_id)
+  item_index <- which(colnames(user_item_matrix) == item_id)
+  
+   # Get the ratings and similarity for target item and user
+  user_ratings <- user_item_matrix[user_index, ]
+  item_similarities <- item_similarity[item_index, ]
+  
+  # Filter out zero ratings
+  non_zero_ratings <- user_ratings != 0
+  user_ratings <- user_ratings[non_zero_ratings]
+  item_similarities <- item_similarities[non_zero_ratings]
+  
+  # Calculate the weighted sum of ratings
+  weighted_sum <- sum(item_similarities * user_ratings)
+  sum_similarities <- sum(item_similarities)
+  
+  # Only predict if sum of similarities is above the threshold
+  if (sum_similarities > similarity_threshold) {
+    predicted_rating <- weighted_sum / sum_similarities
+    return(predicted_rating)
+  } else {
+    return(NA)
+  }
+}
+
+# Example prediction for a specific user and item
+user_id <- rownames(user_item_matrix)[1]
+item_id <- colnames(user_item_matrix)[1]
+predicted_rating_item <- predict_rating_item_based(user_id, item_id, user_item_matrix, item_similarity)
+#print(predicted_rating_item)
+
+
+```
+
+
+This function was tested on the first user and book on the user-item matrix and it returned an estimated rating of `r sprintf("%.2f", predicted_rating_item)`.
+
+To develop further on this solution, another function was created to predict top-N recommendations for an existing user, building on the previous function. This new function identifies and predicts ratings for items the user has not rated. The predictions are then ordered, and the top-N items are returned with book details like Name and Year of publishing included. This function was tested, producing the recommendations as printed below.
+
+
+```{r}
+#| echo: false
+# Function to generate top-N recommendations for a user using item-based CF
+generate_recommendations_item_based <- function(user_id, user_item_matrix, item_similarity, filtered_ratings, N = 5) {
+  # Get the index of the user
+  user_index <- which(rownames(user_item_matrix) == user_id)
+  
+  # Get the user's ratings
+  user_ratings <- user_item_matrix[user_index, ]
+  
+  # Predict ratings for all items
+  predicted_ratings <- sapply(1:ncol(user_item_matrix), function(item_index) {
+    if (user_ratings[item_index] == 0) {  # Only predict for items not rated by the user
+      predict_rating_item_based(user_id, colnames(user_item_matrix)[item_index], user_item_matrix, item_similarity)
+    } else {
+      NA  # Skip items already rated by the user
+    }
+  })
+  
+  # Get the top-N items with the highest predicted ratings
+  top_N_items <- order(predicted_ratings, decreasing = TRUE, na.last = NA)[1:N]
+  top_N_ISBNs <- colnames(user_item_matrix)[top_N_items]
+  top_N_ratings <- predicted_ratings[top_N_items]
+  
+  # Map ISBNs to book titles and include additional information
+  top_N_titles <- filtered_ratings %>% filter(ISBN %in% top_N_ISBNs) %>% distinct(ISBN, `Book-Title`, `Book-Author`, `Year-Of-Publication`)
+  top_N_titles$Predicted_Rating <- top_N_ratings
+  return(top_N_titles)
+}
+
+# Example recommendations for User1 using item-based CF
+user_id <- rownames(user_item_matrix)[1]
+top_N_recommendations_item_based <- generate_recommendations_item_based(user_id, user_item_matrix, item_similarity, filtered_ratings, N = 5)
+#print(top_N_recommendations_item_based)
+
+
+```
+
+```{r}
+#| echo: false
+# Display the top-N recommendations using gt
+library(gt)
+top_N_recommendations_item_based %>%
+  mutate(`Book-Title` = str_sub(`Book-Title`, 1, 30)) %>%
+  select(`Book-Title`, `Year-Of-Publication`, Predicted_Rating) %>%
+  gt() %>%
+  tab_header(
+    title = "Top-N Recommendations for User"
+  ) %>%
+  cols_label(
+    `Book-Title` = "Book Title",
+    `Year-Of-Publication` = "Year",
+    Predicted_Rating = "Predicted Rating"
+  ) %>%
+  fmt_number(
+    columns = c(Predicted_Rating),
+    decimals = 2
+  )
+
+
+```
+
+To complete this section. A function was created to recommend books using item-based CF for new users. The function takes in a set of books ISBNs and the ratings that were given by the new user. It then predicts ratings based on user supplied ratings and item similarities from the item-similarity matrix. The function was tested with ratings of 3, 4, 5, 6 and 7 on the first 5 books on the user-item matrix. The top recommendations were as presented in the table below.
+
+```{r}
+#| echo: false
+# Function to predict ratings for a new user using item-based CF
+predict_rating_new_user <- function(new_user_ratings, item_similarity, similarity_threshold = 0.01) {
+   # Initialize a vector to store predicted ratings
+  predicted_ratings <- rep(NA, ncol(item_similarity))
+  names(predicted_ratings) <- colnames(item_similarity)
+  
+  # Iterate over all items to predict ratings
+  for (item in names(predicted_ratings)) {
+    if (!item %in% names(new_user_ratings)) {
+      item_similarities <- item_similarity[item, ]
+       # Filter out zero ratings
+      non_zero_ratings <- new_user_ratings != 0
+      user_ratings <- new_user_ratings[non_zero_ratings]
+      # Get the similarities for the target item
+      item_similarities <- item_similarities[names(user_ratings)]
+      
+      weighted_sum <- sum(item_similarities * user_ratings)
+      sum_similarities <- sum(item_similarities)
+      
+      # Only predict if sum of similarities is above the threshold
+      if (sum_similarities > similarity_threshold) {
+        predicted_ratings[item] <- weighted_sum / sum_similarities
+      }
+      # If sum_similarities is below threshold, predicted_rating remains NA
+    }
+  }
+  
+  return(predicted_ratings)
+}
+
+# Function to generate top-N recommendations for a new user using item-based CF
+generate_recommendations_new_user <- function(new_user_ratings, item_similarity, filtered_ratings, N = 5) {
+  # Predict ratings for all items
+  predicted_ratings <- predict_rating_new_user(new_user_ratings, item_similarity)
+  
+  # Get the top-N items with the highest predicted ratings
+  top_N_items <- order(predicted_ratings, decreasing = TRUE, na.last = NA)[1:N]
+  top_N_ISBNs <- names(predicted_ratings)[top_N_items]
+  top_N_ratings <- predicted_ratings[top_N_items]
+  
+  # Map ISBNs to book titles and include additional information
+  top_N_titles <- filtered_ratings %>% filter(ISBN %in% top_N_ISBNs) %>% distinct(ISBN, `Book-Title`, `Book-Author`, `Year-Of-Publication`)
+  top_N_titles$Predicted_Rating <- top_N_ratings
+  return(top_N_titles)
+}
+
+# Example case for a new user
+# Assuming user_item_matrix has at least 6 columns
+new_user_ratings <- setNames(c(3, 4, 5, 6, 7), colnames(user_item_matrix)[c(1, 2, 3, 4, 5)])
+
+# Assuming item_similarity and filtered_ratings are already defined
+top_N_recommendations_new_user <- generate_recommendations_new_user(new_user_ratings, item_similarity, filtered_ratings, N = 5)
+#print(top_N_recommendations_new_user)
+
+```
+
+```{r}
+#| echo: false
+
+# Display the top-N recommendations using gt
+library(gt)
+top_N_recommendations_new_user %>%
+  mutate(`Book-Title` = str_sub(`Book-Title`, 1, 30)) %>%
+  select(`Book-Title`, `Year-Of-Publication`, Predicted_Rating) %>%
+  gt() %>%
+  tab_header(
+    title = "Top-N Recommendations for New User"
+  ) %>%
+  cols_label(
+    `Book-Title` = "Book Title",
+    `Year-Of-Publication` = "Year",
+    Predicted_Rating = "Predicted Rating"
+  ) %>%
+  fmt_number(
+    columns = c(Predicted_Rating),
+    decimals = 2
+  )
+
+```
+
+### User Based CF
+
+```{r}
+#| echo: false
+# Function to predict ratings using user-based collaborative filtering
+predict_rating_user_based <- function(user_id, item_id, user_item_matrix, user_similarity, similarity_threshold = 0.01) {
+   # Get the indices of the user and item
+  user_index <- which(rownames(user_item_matrix) == user_id)
+  item_index <- which(colnames(user_item_matrix) == item_id)
+  
+  # Get the ratings and similarity for target item and user
+  item_ratings <- user_item_matrix[, item_index]
+  user_similarities <- user_similarity[user_index, ]
+  
+  # Filter out zero ratings
+  non_zero_ratings <- item_ratings != 0
+  item_ratings <- item_ratings[non_zero_ratings]
+  user_similarities <- user_similarities[non_zero_ratings]
+  
+  # Calculate the weighted sum of ratings
+  weighted_sum <- sum(user_similarities * item_ratings)
+  sum_similarities <- sum(user_similarities)
+  
+  # Only predict if sum of similarities is above the threshold
+  if (sum_similarities > similarity_threshold) {
+    predicted_rating <- weighted_sum / sum_similarities
+    return(predicted_rating)
+  } else {
+    return(NA)
+  }
+}
+
+
+# Example prediction for a specific user and item
+user_id <- rownames(user_item_matrix)[1]
+item_id <- colnames(user_item_matrix)[1]
+predicted_rating_user <- predict_rating_user_based(user_id, item_id, user_item_matrix, user_similarity)
+#print(predicted_rating_user)
+
+```
+
+The development of a User-based CF model followed a similar path as the item-based model. The main difference was that the user based model made use of the user-similarity matrix instead of item similarity. The prediction for the first item and user on the matrix was `r sprintf("%.2f", predicted_rating_user)`.
+
+When prompted to display the top recommendation for user 1, the user-based CF model produced the results tabled below.
+
+
+```{r}
+#| echo: false
+#| include: false
+# Function to generate top-N recommendations for a user using user-based CF
+generate_recommendations_user_based <- function(user_id, user_item_matrix, user_similarity, filtered_ratings, N = 5) {
+  # Get the index of the user
+  user_index <- which(rownames(user_item_matrix) == user_id)
+  
+  # Predict ratings for all items
+  predicted_ratings <- sapply(1:ncol(user_item_matrix), function(item_index) {
+    if (user_item_matrix[user_index, item_index] == 0) {  # Only predict for items not rated by the user
+      predict_rating_user_based(user_id, colnames(user_item_matrix)[item_index], user_item_matrix, user_similarity)
+    } else {
+      NA  # Skip items already rated by the user
+    }
+  })
+  
+  # Get the top-N items with the highest predicted ratings
+  top_N_items <- order(predicted_ratings, decreasing = TRUE, na.last = NA)[1:N]
+  top_N_ISBNs <- colnames(user_item_matrix)[top_N_items]
+  top_N_ratings <- predicted_ratings[top_N_items]
+  
+  # Map ISBNs to book titles and include additional information
+  top_N_titles <- filtered_ratings %>% filter(ISBN %in% top_N_ISBNs) %>% distinct(ISBN, `Book-Title`, `Book-Author`, `Year-Of-Publication`)
+  top_N_titles$Predicted_Rating <- top_N_ratings
+  return(top_N_titles)
+}
+
+# Example recommendations for User1 using user-based CF
+user_id <- rownames(user_item_matrix)[1]
+top_N_recommendations_user_based <- generate_recommendations_user_based(user_id, user_item_matrix, user_similarity, filtered_ratings, N = 5)
+print(top_N_recommendations_user_based)
+
+```
+
+```{r}
+#| echo: false
+# Display the top-N recommendations using gt
+library(gt)
+top_N_recommendations_user_based %>%
+  mutate(`Book-Title` = str_sub(`Book-Title`, 1, 30)) %>%
+  select(`Book-Title`, `Year-Of-Publication`, Predicted_Rating) %>%
+  gt() %>%
+  tab_header(
+    title = "Top-N Recommendations for User"
+  ) %>%
+  cols_label(
+    `Book-Title` = "Book Title",
+    `Year-Of-Publication` = "Publication Year",
+    Predicted_Rating = "Predicted Rating"
+  ) %>%
+  fmt_number(
+    columns = c(Predicted_Rating),
+    decimals = 2
+  )
+```
+
+There was one notable difference in creating the function to generate book recommendations for a new user in this section. Since this model compares different users together, the user-similarity scores had to be calculated separately as the details of the new user would not be in the user-similarity matrix. This was one significant step that was needed in order for this function to work. The top recommendations for our test new user were as shown in the table below.
+
+```{r}
+#| echo: false
+#| include: false
+# Function to calculate similarity between two users
+calculate_similarity <- function(user1, user2) {
+  common_items <- intersect(names(user1), names(user2))
+  if (length(common_items) < 2) return(0)
+  
+  ratings1 <- user1[common_items]
+  ratings2 <- user2[common_items]
+  
+  if (sd(ratings1) == 0 || sd(ratings2) == 0) return(0)
+  
+  correlation <- cor(ratings1, ratings2)
+  return(if (is.na(correlation)) 0 else correlation)
+}
+
+# Function to predict ratings for a new user using user-based CF
+predict_rating_new_user_user_based <- function(new_user_ratings, user_item_matrix, similarity_threshold = 0.01) {
+  # Calculate similarity between the new user and existing users
+  new_user_similarity <- sapply(1:nrow(user_item_matrix), function(i) {
+    existing_user_ratings <- user_item_matrix[i, ]
+    calculate_similarity(new_user_ratings, existing_user_ratings)
+  })
+  
+  # Initialize a vector to store predicted ratings
+  predicted_ratings <- rep(NA, ncol(user_item_matrix))
+  names(predicted_ratings) <- colnames(user_item_matrix)
+  
+  # Iterate over all items to predict ratings
+  for (item in names(predicted_ratings)) {
+    if (!item %in% names(new_user_ratings)) {
+      item_ratings <- user_item_matrix[, item]
+      
+      # Filter out zero ratings and get corresponding similarities
+      non_zero_ratings <- item_ratings != 0
+      item_ratings <- item_ratings[non_zero_ratings]
+      user_similarities <- new_user_similarity[non_zero_ratings]
+      
+      # Only consider users with similarity above the threshold
+      above_threshold <- user_similarities > similarity_threshold
+      item_ratings <- item_ratings[above_threshold]
+      user_similarities <- user_similarities[above_threshold]
+      
+      if (length(user_similarities) > 0) {
+        weighted_sum <- sum(user_similarities * item_ratings, na.rm = TRUE)
+        sum_similarities <- sum(user_similarities, na.rm = TRUE)
+        
+        if (sum_similarities > 0) {
+          predicted_ratings[item] <- weighted_sum / sum_similarities
+        }
+      }
+    }
+  }
+  
+  return(predicted_ratings)
+}
+
+# Function to generate top-N recommendations for a new user using user-based CF
+generate_recommendations_new_user_user_based <- function(new_user_ratings, user_item_matrix, filtered_ratings, N = 5) {
+  # Predict ratings for all items
+  predicted_ratings <- predict_rating_new_user_user_based(new_user_ratings, user_item_matrix)
+  
+  # Create a data frame with ISBNs and predicted ratings
+  predictions_df <- data.frame(
+    ISBN = names(predicted_ratings),
+    Predicted_Rating = predicted_ratings
+  ) %>%
+    filter(!is.na(Predicted_Rating)) %>%
+    arrange(desc(Predicted_Rating), ISBN) %>%  # Sort by rating and then ISBN for consistency
+    head(N)
+  
+  # Map ISBNs to book titles and include additional information
+  top_N_titles <- filtered_ratings %>% 
+    filter(ISBN %in% predictions_df$ISBN) %>% 
+    distinct(ISBN, `Book-Title`, `Book-Author`, `Year-Of-Publication`) %>%
+    left_join(predictions_df, by = "ISBN") %>%
+    arrange(desc(Predicted_Rating), ISBN)  # Ensure final sorting matches predictions_df
+  
+  return(top_N_titles)
+}
+
+# Example case for a new user
+# Assuming user_item_matrix has at least 10 columns
+new_user_ratings <- setNames(c(3, 4, 5, 6, 7), colnames(user_item_matrix)[c(1, 2, 3, 4, 5)])
+
+# Assuming filtered_ratings is already defined
+top_N_recommendations_new_user_user_based <- generate_recommendations_new_user_user_based(new_user_ratings, user_item_matrix, filtered_ratings, N = 5)
+#print(top_N_recommendations_new_user_user_based)
+
+
+
+
+
+```
+
+```{r}
+#| echo: false
+# Display the top-N recommendations using gt
+library(gt)
+top_N_recommendations_new_user_user_based %>%
+  mutate(`Book-Title` = str_sub(`Book-Title`, 1, 30)) %>%
+  select(`Book-Title`, `Year-Of-Publication`, Predicted_Rating) %>%
+  gt() %>%
+  tab_header(
+    title = "Top-N Recommendations for New User"
+  ) %>%
+  cols_label(
+    `Book-Title` = "Book Title",
+    `Year-Of-Publication` = "Publication Year",
+    Predicted_Rating = "Predicted Rating"
+  ) %>%
+  fmt_number(
+    columns = c(Predicted_Rating),
+    decimals = 2
+  )
+```
+
+## Matrix Factorization model
+
+Implied ratings, which had been excluded for the previous sections, were now joined with explicit ratings for the matrix factorization recommender system. The implied ratings were all converted to a rating of 5 which is at the median of the rating scale. Only the ratings of books that were also in the user-item matrix were retained. This was to ensure continuity among the models. The now combined ratings were partitioned in a 80:20 for train and test set of the matrix factorization model.
+
+```{r}
+#| include: false
+#| echo: false
+# Filter implicit ratings to include only those with ISBN numbers present in filtered_ratings
+# and books that have names (not NAs)
+implicit_ratings <- ratings %>% filter(`Book-Rating` == 0) %>% 
+  filter(ISBN %in% filtered_ratings$ISBN) %>% 
+  filter(`User-ID` %in% filtered_ratings$`User-ID`) %>% 
+  inner_join(books %>% filter(!is.na(`Book-Title`)), by = "ISBN") %>% 
+  mutate(`Book-Rating` = 5)  # Assign a default rating for implicit data
+
+
+# Combine explicit and implicit ratings
+combined_ratings <- bind_rows(filtered_ratings, implicit_ratings)
+
+# Prepare the data for recosystem
+reco_data <- combined_ratings %>% select(`User-ID`, ISBN, `Book-Rating`)
+colnames(reco_data) <- c("user", "item", "rating")
+
+# Create mappings for users and items
+user_mapping <- reco_data %>% distinct(user) %>% mutate(user_index = row_number())
+item_mapping <- reco_data %>% distinct(item) %>% mutate(item_index = row_number())
+
+# Merge the mappings with the reco_data
+reco_data <- reco_data %>%
+  left_join(user_mapping, by = "user") %>%
+  left_join(item_mapping, by = "item")
+
+# Check for NA values and remove them
+reco_data <- reco_data %>% filter(!is.na(user_index) & !is.na(item_index) & !is.na(rating))
+
+# Create a train/test split
+set.seed(123)  # For reproducibility
+train_indices <- sample(seq_len(nrow(reco_data)), size = 0.8 * nrow(reco_data))
+train_data <- reco_data[train_indices, ]
+test_data <- reco_data[-train_indices, ]
+
+# Convert the train and test data to the recosystem format
+train_set <- data_memory(user_index = train_data$user_index, item_index = train_data$item_index, rating = train_data$rating)
+test_set <- data_memory(user_index = test_data$user_index, item_index = test_data$item_index)
+
+# Create a Reco object
+r <- Reco()
+
+# Train the model
+r$train(train_set, opts = list(dim = 10, lrate = 0.1, costp_l2 = 0.01, costq_l2 = 0.01, niter = 20))
+
+# Predict ratings for the test set
+predicted_ratings <- r$predict(test_set)
+
+# Calculate RMSE
+actual_ratings <- test_data$rating
+rmse <- sqrt(mean((predicted_ratings - actual_ratings)^2))
+print(paste("RMSE:", rmse))
+
+```
+
+```{r}
+#| include: false
+#| echo: false
+# Train the model without regularization
+r_no_reg <- Reco()
+r_no_reg$train(train_set, opts = list(dim = 10, lrate = 0.1, niter = 20))
+
+# Predict ratings for the test set
+predicted_ratings_no_reg <- r_no_reg$predict(test_set)
+
+# Calculate RMSE
+rmse_no_reg <- sqrt(mean((predicted_ratings_no_reg - actual_ratings)^2))
+print(paste("RMSE without regularization:", rmse_no_reg))
+
+```
+
+```{r}
+#| echo: false
+#| include: false
+# RMSE with regularization (already calculated)
+print(paste("RMSE with regularization:", rmse))
+
+# RMSE without regularization
+print(paste("RMSE without regularization:", rmse_no_reg))
+
+```
+
+Two matrix factorization models were fit using the recosystem package: one with regularization and another one without regularization. To measure the accuracy of the models, the Root Mean Square Error (RMSE) metric was used. The regularized model had an RMSE of `r sprintf("%.2f", rmse)` whereas the model without regularization had an RMSE of `r sprintf("%.2f", rmse_no_reg)`. The model without regularization was used for the ensemble model as it had a lower RMSE.
+
+
+```{r}
+#| echo: false
+#| include: false
+
+# Function to predict ratings using item-based collaborative filtering
+predict_rating_item_based <- function(user_id, item_id, user_item_matrix, item_similarity) {
+  user_index <- which(rownames(user_item_matrix) == user_id)
+  item_index <- which(colnames(user_item_matrix) == item_id)
+  user_ratings <- user_item_matrix[user_index, ]
+  item_similarities <- item_similarity[item_index, ]
+  non_zero_ratings <- user_ratings != 0
+  user_ratings <- user_ratings[non_zero_ratings]
+  item_similarities <- item_similarities[non_zero_ratings]
+  weighted_sum <- sum(item_similarities * user_ratings)
+  sum_similarities <- sum(item_similarities)
+  predicted_rating <- ifelse(sum_similarities == 0, NA, weighted_sum / sum_similarities)
+  return(predicted_rating)
+}
+
+# Function to predict ratings using user-based collaborative filtering
+predict_rating_user_based <- function(user_id, item_id, user_item_matrix, user_similarity) {
+  user_index <- which(rownames(user_item_matrix) == user_id)
+  item_index <- which(colnames(user_item_matrix) == item_id)
+  item_ratings <- user_item_matrix[, item_index]
+  user_similarities <- user_similarity[user_index, ]
+  non_zero_ratings <- item_ratings != 0
+  item_ratings <- item_ratings[non_zero_ratings]
+  user_similarities <- user_similarities[non_zero_ratings]
+  weighted_sum <- sum(user_similarities * item_ratings)
+  sum_similarities <- sum(user_similarities)
+  predicted_rating <- ifelse(sum_similarities == 0, NA, weighted_sum / sum_similarities)
+  return(predicted_rating)
+}
+
+# Function to predict ratings using matrix factorization (recosystem)
+predict_rating_matrix_factorization <- function(user_id, item_id, user_mapping, item_mapping, r) {
+  user_index <- user_mapping %>% filter(user == user_id) %>% pull(user_index)
+  item_index <- item_mapping %>% filter(item == item_id) %>% pull(item_index)
+  predicted_rating <- r$predict(data_memory(user_index = user_index, item_index = item_index))
+  predicted_rating <- pmin(pmax(predicted_rating, 1), 10)  # Clip the rating to be within 1 and 10
+  return(predicted_rating)
+}
+
+# Function to generate ensemble predictions
+predict_rating_ensemble <- function(user_id, item_id, user_item_matrix, item_similarity, user_similarity, user_mapping, item_mapping, r, weights = c(0.33, 0.33, 0.34)) {
+  pred_item_based <- predict_rating_item_based(user_id, item_id, user_item_matrix, item_similarity)
+  pred_user_based <- predict_rating_user_based(user_id, item_id, user_item_matrix, user_similarity)
+  pred_matrix_factorization <- predict_rating_matrix_factorization(user_id, item_id, user_mapping, item_mapping, r)
+  ensemble_prediction <- weights[1] * pred_item_based + weights[2] * pred_user_based + weights[3] * pred_matrix_factorization
+  return(ensemble_prediction)
+}
+
+# Example prediction for a specific user and item using the ensemble model
+user_id <- rownames(user_item_matrix)[1]  # Replace with the actual user ID
+item_id <- colnames(user_item_matrix)[1]  # Replace with the actual item ID
+ensemble_prediction <- predict_rating_ensemble(user_id, item_id, user_item_matrix, item_similarity, user_similarity, user_mapping, item_mapping, r)
+print(paste("Ensemble predicted rating for user", user_id, "and item", item_id, ":", ensemble_prediction))
+
+# Function to evaluate the ensemble model
+evaluate_ensemble_model <- function(test_data, user_item_matrix, item_similarity, user_similarity, user_mapping, item_mapping, r, weights = c(0.33, 0.33, 0.34)) {
+  predicted_ratings <- sapply(1:nrow(test_data), function(i) {
+    user_id <- test_data$user[i]
+    item_id <- test_data$item[i]
+    pred <- predict_rating_ensemble(user_id, item_id, user_item_matrix, item_similarity, user_similarity, user_mapping, item_mapping, r, weights)
+    if (is.na(pred)) {
+      pred <- mean(test_data$rating, na.rm = TRUE)  # Use mean rating as default value
+    }
+    return(pred)
+  })
+  actual_ratings <- test_data$rating
+  rmse <- sqrt(mean((predicted_ratings - actual_ratings)^2))
+  return(rmse)
+}
+
+# Evaluate the ensemble model
+ensemble_rmse <- evaluate_ensemble_model(test_data, user_item_matrix, item_similarity, user_similarity, user_mapping, item_mapping, r)
+print(paste("Ensemble RMSE:", ensemble_rmse))
+```
+
+The ensemble model was made by aggregating the recommendations from the three types of models that were built for this project. All the models were weighed equally. The ensemble model RMSE was `r sprintf("%.2f", ensemble_rmse)`. The recommendations produced by the ensemble model were as shown below.
+
+## Conclusion
+
+This report explored different methods and techniques that are used in building recommender systems. Three different models were explored which include user-based CF, item-based CF, and matrix factorization system. An ensemble system was also built, combining all the three models, though its performance was worse compared to the standalone matrix factorization. The concepts and techniques applied were mostly discovered through online non-academic tools. The author notes a few areas for future consideration. These include finding the effect of sampling variation, investigating the effect of different standardization techniques to remove bias, and investigating the spatial-temporal aspect of the data to see how recommendations vary over locations and time.
+
